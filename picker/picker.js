@@ -119,12 +119,25 @@
           }
         },
         error_callback: function (err) {
+          // Observabilidad: NO cerrar popup tras error GIS. Mostrar el tipo en pantalla
+          // para que Diego lo lea sin necesidad de DevTools del popup (que cerraría
+          // junto con la ventana). El cierre lo hace el user manualmente.
+          var errType = (err && err.type) || String(err);
+          var errMsg  = (err && err.message) || '';
+          console.error('[picker] GIS error_callback:', err);
+          setStatus(
+            'Error OAuth: ' + errType +
+            (errMsg ? ' - ' + errMsg : '') +
+            ' (cierra esta ventana manualmente cuando termines de leer)',
+            true
+          );
           sendToParent({
-            type:   'picker-cancel',
-            reason: 'token_error',
-            error:  (err && err.type) || String(err)
+            type:    'picker-cancel',
+            reason:  'token_error',
+            error:   errType,
+            details: errMsg || null
           });
-          window.close();
+          // NO window.close() — popup queda abierta para diagnóstico.
         }
       });
       state.tokenClient.requestAccessToken({ prompt: '' });
