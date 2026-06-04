@@ -136,14 +136,29 @@
     if (!state.gapiLoaded || !state.accessToken || !state.apiKey || state.pickerReady) return;
     state.pickerReady = true;
 
-    var docsView = new google.picker.DocsView(google.picker.ViewId.DOCS)
+    // 3 DocsView para mostrar tabs nativos del Picker: My Drive, Shared with me, Recent.
+    // Sin .setOwnedByMe en myDriveView → muestra TODO el Drive del user (own + shared).
+    var myDriveView = new google.picker.DocsView(google.picker.ViewId.DOCS)
       .setMimeTypes('application/pdf')
-      .setOwnedByMe(false);
+      .setIncludeFolders(false)
+      .setSelectFolderEnabled(false);
+
+    var sharedView = new google.picker.DocsView(google.picker.ViewId.DOCS)
+      .setMimeTypes('application/pdf')
+      .setOwnedByMe(false)
+      .setIncludeFolders(false)
+      .setSelectFolderEnabled(false);
+
+    var recentView = new google.picker.DocsView(google.picker.ViewId.RECENTLY_PICKED)
+      .setMimeTypes('application/pdf');
 
     var picker = new google.picker.PickerBuilder()
       .setOAuthToken(state.accessToken)
       .setDeveloperKey(state.apiKey)
-      .addView(docsView)
+      .addView(myDriveView)
+      .addView(sharedView)
+      .addView(recentView)
+      .setSize(window.innerWidth, window.innerHeight)
       .setCallback(function (data) {
         if (data.action === google.picker.Action.PICKED) {
           var doc = data.docs[0];
