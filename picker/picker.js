@@ -47,12 +47,11 @@
     }
   }
 
-  // Lazy: tras cargar gapi.picker + GIS, enviamos 'picker-ready' al parent.
+  // Lazy: tras cargar gapi.picker + GIS Y tener parentOrigin (del parent-hello),
+  // enviamos 'picker-ready' al parent.
   function checkBothLoaded() {
-    if (state.gapiLoaded && state.gisLoaded && !state.pickerReady) {
+    if (state.gapiLoaded && state.gisLoaded && state.parentOrigin && !state.pickerReady) {
       state.pickerReady = true;
-      // Si el parent ya nos mandó algo, su origin está fijado; si no, lo
-      // sabremos cuando llegue el primer mensaje válido.
       sendToParent({ type: 'picker-ready' });
       setStatus('Esperando configuracion...');
     }
@@ -80,15 +79,22 @@
   loadGapiPicker();
   checkGis();
 
-  // Recepción del mensaje 'init' (credentials) del parent.
+  // Handshake: parent habla primero con 'parent-hello' (fija parentOrigin);
+  // credentials llegan solo en 'init'.
   window.addEventListener('message', function (event) {
     if (!isAllowedOrigin(event.origin)) {
-      // No log de event.data — puede contener credentials.
+      console.warn('[picker] message from disallowed origin:', event.origin);
       return;
     }
     state.parentOrigin = event.origin;
     var msg = event.data;
-    if (!msg || typeof msg !== 'object') return;
+    if (!msg || !msg.type) return;
+
+    if (msg.type === 'parent-hello') {
+      // Parent nos confirma su origin. Si gapi+GIS ya cargados, enviar picker-ready ahora.
+      checkBothLoaded();
+      return;
+    }
 
     if (msg.type === 'init' && msg.api_key && msg.client_id) {
       state.apiKey   = msg.api_key;
