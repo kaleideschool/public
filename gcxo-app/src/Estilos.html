@@ -1,0 +1,239 @@
+<style>
+  :root {
+    --version-est: est-11;
+    --azul: #1a56db; --verde: #0a7d33; --rojo: #b00020; --gris: #667085;
+    --borde: #e4e7ec; --fondo: #f9fafb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    font-size: 14px; color: #101828; margin: 0; background: #fff;
+  }
+  /* El ancho de la app. Estuvo en 860px, que en una pantalla panorámica dejaba
+     media pantalla vacía Y obligaba al turnero —31 días por 35 personas— a
+     scrollear dentro de su propia caja para caber en un hueco que sobraba por
+     todos lados. Lo que manda ahora es el CONTENIDO: la rejilla del mes pide
+     unos 1.200px, así que el marco llega hasta 1.600 y a partir de ahí para,
+     porque una línea de texto de 2.000px no se lee.
+     Los paneles que son formulario o texto llevan su propio tope más estrecho
+     (`maxWidth` en el componente): ahí lo cómodo es lo angosto, no lo ancho. */
+  #root { max-width: 1600px; margin: 0 auto; padding: 16px; }
+
+  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  .usuario { font-size: 12px; color: var(--gris); }
+  .rolchip { display: inline-block; background: #eef2ff; color: var(--azul); border-radius: 10px; padding: 1px 8px; font-size: 11px; margin-left: 6px; }
+
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--borde); margin-bottom: 14px; }
+  .tab { padding: 8px 12px; cursor: pointer; border: none; background: none; font-size: 13px; color: var(--gris); border-bottom: 2px solid transparent; }
+  .tab.activa { color: var(--azul); border-bottom-color: var(--azul); font-weight: 600; }
+
+  /* Sub-pestañas: el mismo patrón, un peldaño por debajo. Sin la línea
+     inferior a todo lo ancho, para que no compita con la barra de arriba. */
+  .tabs.subtabs {
+    border-bottom: none; gap: 2px; margin: 0 0 12px;
+    background: var(--fondo); border-radius: 8px; padding: 3px;
+    display: inline-flex; max-width: 100%;
+  }
+  .tabs.subtabs .tab {
+    padding: 6px 12px; border-bottom: none; border-radius: 6px; font-size: 12px;
+  }
+  .tabs.subtabs .tab.activa {
+    background: #fff; color: var(--azul);
+    box-shadow: 0 1px 2px rgba(16,24,40,.08);
+  }
+
+  select, input[type=text] { padding: 6px 8px; border: 1px solid var(--borde); border-radius: 6px; font-size: 13px; }
+  button.accion { background: var(--azul); color: #fff; border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button.accion:disabled { background: #c3c8d0; cursor: not-allowed; }
+  button.sec { background: #fff; color: #101828; border: 1px solid var(--borde); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+  button.ok { background: var(--verde); }
+  button.no { background: var(--rojo); }
+
+  .calhead { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-bottom: 4px; }
+  .wd { text-align: center; font-size: 11px; font-weight: 700; color: var(--gris); }
+  .wd.finde { color: #b54708; }
+  /* El mes son 7 columnas: estirarlas a 1.600px daría celdas enormes con una
+     letra en medio. Se le pone su propio tope, que es lo que pedía el diseño
+     desde el principio — lo que no cabía era el turnero, no esto. */
+  .cal, .calhead { max-width: 900px; }
+  .cal { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+  .celda { border: 1px solid var(--borde); border-radius: 6px; padding: 6px 4px; text-align: center; min-height: 48px; }
+  .celda.vacia { border: none; background: transparent; min-height: 0; }
+  .celda.finde { background: #fff7ed; }
+  .celda.clic { cursor: pointer; }
+  .celda.clic:hover { border-color: var(--azul); box-shadow: 0 0 0 1px var(--azul) inset; }
+  .celda.sel { border: 2px solid var(--azul); }
+  .celda.bloq { opacity: .55; background: #eef0f2; }
+  .celda .d { font-size: 11px; color: var(--gris); }
+  .celda .t { font-weight: 700; margin-top: 2px; }
+  .t.M, .t.Ms, .t.Mo { color: #b54708; }
+  .t.T, .t.Ts, .t.To { color: #175cd3; }
+  .t.im, .t.it { color: #6941c6; }
+
+  .tarjeta { border: 1px solid var(--borde); border-radius: 8px; padding: 12px; margin-bottom: 10px; background: var(--fondo); }
+  .tarjeta .cab { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .estado { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
+  .estado.REGISTRADO { background: #fff4e5; color: #b54708; }
+  .estado.CONFIRMADO { background: #eef4ff; color: #175cd3; }
+  .estado.VALIDADO { background: #e7f6ec; color: var(--verde); }
+  .estado.TRANSCRITO { background: #e6e6e6; color: #333; }
+  .estado.RECHAZADO, .estado.CADUCADO, .estado.ANULADO { background: #fde7ea; color: var(--rojo); }
+
+  .verde { color: var(--verde); font-weight: 600; }
+  .rojo { color: var(--rojo); font-weight: 600; }
+  .aviso-legal { border: 1px solid #f5c2c7; background: #fdf1f2; border-radius: 6px; padding: 8px; margin: 8px 0; }
+  .aviso-legal ul { margin: 6px 0 0 18px; padding: 0; }
+  .fila { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  .muted { color: var(--gris); font-size: 12px; }
+  /* Diálogo propio: window.confirm enseña el dominio de googleusercontent. */
+  .modal-fondo {
+    position: fixed; inset: 0; background: rgba(16,24,40,.45);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100; padding: 16px;
+  }
+  .modal {
+    background: #fff; border-radius: 10px; max-width: 460px; width: 100%;
+    box-shadow: 0 10px 40px rgba(16,24,40,.25); padding: 18px;
+  }
+  .modal-tit { margin: 0 0 8px; font-size: 16px; }
+  .modal-cuerpo { font-size: 14px; color: #101828; }
+  .modal-cuerpo p { margin: 0 0 6px; }
+  .modal-pie { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+  /* ⚠️ Esto era un velo a pantalla completa que tapaba la app y se tragaba los
+     clics: cualquier guardado dejaba sin hacer nada más que esperar. Ahora es
+     un aviso en una esquina y NO intercepta el ratón (pointer-events: none),
+     así que se puede seguir trabajando mientras el guardado va por detrás. */
+  .overlay {
+    position: fixed; right: 14px; bottom: 14px; z-index: 50;
+    pointer-events: none;
+    background: #101828; color: #fff; opacity: .92;
+    border-radius: 999px; padding: 7px 14px;
+    font-size: 12px; font-weight: 600;
+    box-shadow: 0 4px 14px rgba(16,24,40,.25);
+  }
+  .comp { display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--borde); border-radius: 6px; padding: 6px 10px; margin: 4px 0; background: #fff; }
+
+  table.bal { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  table.bal th, table.bal td { border: 1px solid var(--borde); padding: 5px 8px; text-align: center; font-size: 12px; }
+  table.bal th { background: #f0f0f0; }
+  table.bal td:first-child, table.bal th:first-child { text-align: left; }
+
+  /* ========= RESPONSIVE / MÓVIL ========= */
+  .tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .comp { flex-wrap: wrap; }
+
+  /* ═══ Tabla del Turnero Global ═══════════════════════════════════════════
+     Rejilla de 30×35: lo que la hace legible no es el color, es el ritmo.
+     Líneas casi invisibles dentro de cada grupo, bandas de fondo alternas
+     para separarlos, y color SOLO donde significa algo (baja, vacaciones). */
+  /* La tabla scrollea DENTRO de esta caja. Es lo que hace que la cabecera y la
+     columna de iniciales se queden fijas: con el scroll en la página, el
+     `sticky` se pegaba al borde del contenedor y se iba igual. */
+  /* El scroll horizontal es el ÚLTIMO recurso, no el diseño: con el marco a
+     1.600px la rejilla entra entera en cualquier pantalla de portátil para
+     arriba, y esto solo actúa en tablet o móvil. El vertical sí es a propósito:
+     es lo que mantiene pegadas la cabecera y la columna de iniciales. */
+  .turnero-caja {
+    overflow: auto;
+    max-height: 78vh;
+    border: 1px solid #d7dce3;
+    border-radius: 6px;
+  }
+  .tabla-turnero {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-variant-numeric: tabular-nums;   /* cifras de ancho fijo */
+  }
+  .tabla-turnero th,
+  .tabla-turnero td {
+    border-right: 1px solid #eef0f3;
+    border-bottom: 1px solid #eef0f3;
+    text-align: center;
+    font-size: 12px;
+    padding: 4px 3px;
+    min-width: 26px;
+    white-space: nowrap;
+  }
+  .tabla-turnero thead th {
+    position: sticky; top: 0; z-index: 3;
+    background: #f8fafc;
+    border-bottom: 2px solid #d7dce3;
+    font-size: 11px; font-weight: 700; color: #475467;
+  }
+  .tabla-turnero thead tr:nth-child(2) th { top: 26px; }   /* bajo la fila de letras */
+
+  /* Los días, repetidos al pie y pegados abajo */
+  .tabla-turnero tfoot th {
+    position: sticky; bottom: 0; z-index: 3;
+    background: #f8fafc;
+    border-top: 2px solid #d7dce3;
+    font-size: 11px; font-weight: 700; color: #475467;
+  }
+  .tabla-turnero tfoot .col-cta { z-index: 4; }
+
+  /* La columna de iniciales no se va al desplazar */
+  .tabla-turnero .col-cta {
+    position: sticky; left: 0; z-index: 2;
+    background: #f8fafc;
+    font-weight: 700; text-align: left;
+    padding: 4px 8px; min-width: 46px;
+    border-right: 2px solid #d7dce3;
+  }
+  .tabla-turnero thead .col-cta { z-index: 4; }
+
+  /* Bandas de grupo: dos tonos casi iguales, solo para agrupar la vista */
+  .tabla-turnero tr.g0 td { background: #ffffff; }
+  .tabla-turnero tr.g1 td { background: #fafbfd; }
+  .tabla-turnero tr.g0 .col-cta { background: #f4f6f9; }
+  .tabla-turnero tr.g1 .col-cta { background: #eef1f6; }
+  .tabla-turnero tr.abre-grupo td { border-top: 2px solid #d7dce3; }
+
+  /* Fin de semana: solo la cabecera, como en el cuadrante */
+  .tabla-turnero th.th-finde { background: #fff8c5; color: #7a5d00; }
+  .tabla-turnero td.bg-finde { box-shadow: inset 0 0 0 99px rgba(255,248,197,.35); }
+
+  /* Color solo donde significa algo */
+  .tabla-turnero td.turno-baja       { background: #d92d20 !important; color: #fff; font-weight: 700; }
+  .tabla-turnero td.turno-vacaciones { background: #98a2b3 !important; color: #fff; }
+  .tabla-turnero td.turno-activada   { background: #22ccee !important; color: #05384d; font-weight: 700; }
+  .tabla-turnero td.turno-voluntaria { background: #2e6fd9 !important; color: #fff; font-weight: 700; }
+  .tabla-turnero td.turno-extra      { background: #12a150 !important; color: #fff; font-weight: 700; }
+  .tabla-turnero td.turno-fuera      { background: #f79009 !important; color: #4a2900; font-weight: 700; }
+
+  /* Horas: que respiren y no se apelotonen */
+  .tabla-turnero .col-horas {
+    background: #eef2f7 !important;
+    font-weight: 700; min-width: 62px;
+    padding: 4px 10px;
+    border-left: 2px solid #d7dce3;
+  }
+
+  .tabla-turnero td.celda-sel { outline: 3px solid var(--azul); outline-offset: -3px; font-weight: 700; }
+  .tabla-turnero tr.fila-sel .col-cta { background: #dbe7fb; }
+
+  .leyenda { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--gris); margin: 6px 0; }
+  .leyenda i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+  .leyenda i.turno-baja       { background: #d92d20 !important; }
+  .leyenda i.turno-vacaciones { background: #98a2b3 !important; }
+  .leyenda i.turno-activada   { background: #22ccee !important; }
+  .leyenda i.turno-voluntaria { background: #2e6fd9 !important; }
+  .leyenda i.turno-extra      { background: #12a150 !important; }
+  .leyenda i.turno-fuera      { background: #f79009 !important; }
+
+  @media (max-width: 600px) {
+    #root { padding: 10px; }
+    header { gap: 6px; }
+    header h1 { font-size: 16px; }
+    .cal, .calhead { gap: 4px; }
+    .celda { min-height: 40px; padding: 4px 2px; }
+    .celda .d { font-size: 10px; }
+    .celda .t { font-size: 13px; }
+    .tab { padding: 8px; font-size: 12px; }
+    button.accion, button.sec { min-height: 40px; }   /* objetivos táctiles */
+    table.bal th, table.bal td { padding: 4px 3px; font-size: 11px; }
+    select, input[type=text] { font-size: 16px; }      /* evita el zoom automático en iOS */
+  }
+</style>

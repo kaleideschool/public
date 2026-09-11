@@ -1,0 +1,402 @@
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+<script>
+  const e = React.createElement;
+
+  function App() {
+    const [data, setData]                 = React.useState(null);
+    const [loading, setLoading]           = React.useState(false);
+    const [showConfirm, setShowConfirm]   = React.useState(false);
+    const [showSuccess, setShowSuccess]   = React.useState(false);
+
+    // Estados para detección de cambio de hoja
+    const [hojaActual, setHojaActual]       = React.useState(null);  // { id, nombre }
+    const [hojaAnterior, setHojaAnterior]   = React.useState(null);  // { id, nombre }
+    const [sheetCambiada, setSheetCambiada] = React.useState(false);
+    const [showHojaError, setShowHojaError] = React.useState(false);
+
+    /* ========= POLLING: detectar cambio de hoja cada 3 segundos ========= */
+
+    React.useEffect(() => {
+      let ultimaHoja = null;
+
+      function poll() {
+        google.script.run
+          .withSuccessHandler(hoja => {
+            if (ultimaHoja === null) {
+              // Primera lectura: registrar sin avisar
+              ultimaHoja = hoja;
+              setHojaActual(hoja);
+              return;
+            }
+            if (hoja.id !== ultimaHoja.id) {
+              // La hoja cambió
+              setHojaAnterior(ultimaHoja);
+              ultimaHoja = hoja;
+              setHojaActual(hoja);
+              setSheetCambiada(true);
+            }
+          })
+          .getHojaActual();
+      }
+
+      poll();
+      const intervalo = setInterval(poll, 3000);
+      return () => clearInterval(intervalo);
+    }, []);
+
+    /* ========= BACKEND ========= */
+
+    function calcular() {
+      setLoading(true);
+      google.script.run
+        .withSuccessHandler(result => {
+          setData(result);
+          setLoading(false);
+        })
+        .calcularPropuestas();
+    }
+
+    function recalcular() {
+      setLoading(true);
+      google.script.run
+        .withSuccessHandler(result => {
+          setData(result);
+          setLoading(false);
+        })
+        .recalcularPropuestas(data.propuestas);
+    }
+
+function aplicar() {
+  setLoading(true);
+  // Consultar la hoja activa EN ESTE MOMENTO al backend, no confiar en el estado
+  google.script.run
+    .withSuccessHandler(hojaAhora => {
+      if (hojaAhora.id !== data.meta.mesId) {
+        setLoading(false);
+        setHojaActual(hojaAhora);  // actualizar el estado también
+        setShowHojaError(true);
+        return;
+      }
+      // La hoja coincide: proceder
+      google.script.run
+        .withSuccessHandler(() => {
+          setLoading(false);
+          setShowSuccess(true);
+        })
+        .aplicarPropuestas(data);
+    })
+    .getHojaActual();
+}
+
+    /* ========= HELPERS ========= */
+
+    function cambiarAsignado(clave, nuevoId) {
+      setData(prev => ({
+        ...prev,
+        propuestas: {
+          ...prev.propuestas,
+          [clave]: {
+            ...prev.propuestas[clave],
+            asignadoActual: nuevoId,
+            origen: 'MANUAL'
+          }
+        }
+      }));
+    }
+
+    function toggleBloqueo(clave) {
+      setData(prev => ({
+        ...prev,
+        propuestas: {
+          ...prev.propuestas,
+          [clave]: {
+            ...prev.propuestas[clave],
+            bloqueado: !prev.propuestas[clave].bloqueado
+          }
+        }
+      }));
+    }
+
+    function toggleBloquearTodo() {
+      setData(prev => {
+        const todasBloqueadas =
+          Object.values(prev.propuestas).every(p => p.bloqueado);
+        const nuevas = {};
+        Object.entries(prev.propuestas).forEach(([k, p]) => {
+          nuevas[k] = { ...p, bloqueado: !todasBloqueadas };
+        });
+        return { ...prev, propuestas: nuevas };
+      });
+    }
+
+    /* ========= RENDER: sin datos ========= */
+
+    if (!data) {
+      return e('div', null,
+        loading && e('div', { className: 'overlay' }, '⏳ Calculando propuestas…'),
+
+        e('h2', null, 'Propuestas de supervisión'),
+
+        hojaActual && e('div', {
+          style: { fontSize: '11px', color: '#555', marginBottom: '8px' }
+        }, `Hoja activa: ${hojaActual.nombre}`),
+
+        e('button', { onClick: calcular, disabled: loading }, 'Calcular propuestas'),
+
+        /* Modal hoja cambiada (sin datos calculados aún) */
+        sheetCambiada && e('div', { className: 'modal-overlay' },
+          e('div', { className: 'modal-card' },
+            e('h3', null, '⚠️ Hoja cambiada'),
+            e('p', null,
+              `Has pasado de "${hojaAnterior ? hojaAnterior.nombre : '—'}" ` +
+              `a "${hojaActual ? hojaActual.nombre : '—'}".`
+            ),
+            e('p', null, 'Puedes calcular las propuestas para la hoja actual.'),
+            e('div', { className: 'modal-actions' },
+              e('button', {
+                onClick: () => setSheetCambiada(false)
+              }, 'Cerrar')
+            )
+          )
+        )
+      );
+    }
+
+    /* ========= RENDER: con datos ========= */
+
+    const clavesOrdenadas = Object.keys(data.propuestas).sort((a, b) => {
+      const [da, ta] = a.split('_');
+      const [db, tb] = b.split('_');
+      if (+da !== +db) return +da - +db;
+      return ta.localeCompare(tb);
+    });
+
+    const mostrarOverlay = loading && !showConfirm && !showSuccess;
+
+    return e('div', null,
+
+      mostrarOverlay && e('div', { className: 'overlay' }, '⏳ Procesando…'),
+
+      e('h2', null, 'Propuestas de supervisión'),
+
+      e('div', {
+        style: { fontSize: '11px', color: '#555', marginBottom: '4px' }
+      }, `Usuario: ${data.meta.usuario}`),
+
+      e('div', {
+        style: { fontSize: '11px', color: '#555', marginBottom: '8px' }
+      }, `Hoja: ${data.meta.mes}`),
+
+      e('div', { style: { marginBottom: '8px' } },
+        e('button', { onClick: recalcular, disabled: loading }, 'Recalcular'),
+        e('button', {
+          onClick: () => setShowConfirm(true),
+          disabled: loading
+        }, 'Aplicar y registrar')
+      ),
+
+      renderResumen(data.resumen),
+
+      renderPropuestas(
+        clavesOrdenadas,
+        data.propuestas,
+        cambiarAsignado,
+        toggleBloqueo,
+        toggleBloquearTodo,
+        loading
+      ),
+
+      /* ========= MODAL: confirmar aplicación ========= */
+
+      showConfirm && e('div', { className: 'modal-overlay' },
+        e('div', { className: 'modal-card' },
+          e('h3', null, 'Confirmar aplicación'),
+          e('p', null,
+            `Se aplicarán las supervisiones en la hoja "${data.meta.mes}" ` +
+            'y se registrarán en el LOG_SUPERVISIONES.'
+          ),
+          e('div', { className: 'modal-actions' },
+            e('button', { onClick: () => setShowConfirm(false) }, 'Cancelar'),
+            e('button', {
+              onClick: () => {
+                setShowConfirm(false);
+                aplicar();
+              }
+            }, 'Aplicar')
+          )
+        )
+      ),
+
+      /* ========= MODAL: éxito ========= */
+
+      showSuccess && e('div', { className: 'modal-overlay' },
+        e('div', { className: 'modal-card' },
+          e('h3', null, 'Operación completada'),
+          e('p', null,
+            'Las supervisiones se han aplicado correctamente y el LOG ' +
+            'ha quedado actualizado.'
+          ),
+          e('div', { className: 'modal-actions' },
+            e('button', { onClick: () => setShowSuccess(false) }, 'Cerrar')
+          )
+        )
+      ),
+
+      /* ========= MODAL: hoja cambiada (con datos calculados) ========= */
+
+      sheetCambiada && e('div', { className: 'modal-overlay' },
+        e('div', { className: 'modal-card' },
+          e('h3', null, '⚠️ Hoja cambiada'),
+          e('p', null,
+            `Has pasado de "${hojaAnterior ? hojaAnterior.nombre : '—'}" ` +
+            `a "${hojaActual ? hojaActual.nombre : '—'}".`
+          ),
+          e('p', null,
+            `Los datos del sidebar corresponden a "${data.meta.mes}". ` +
+            '¿Qué quieres hacer?'
+          ),
+          e('div', { className: 'modal-actions' },
+            e('button', {
+              onClick: () => {
+                setSheetCambiada(false);
+                setData(null);
+                calcular();
+              }
+            }, `Calcular para "${hojaActual ? hojaActual.nombre : ''}"`),
+            e('button', {
+              onClick: () => setSheetCambiada(false)
+            }, 'Mantener datos actuales')
+          )
+        )
+      ),
+
+      /* ========= MODAL: intento de aplicar en hoja incorrecta ========= */
+
+      showHojaError && e('div', { className: 'modal-overlay' },
+        e('div', { className: 'modal-card' },
+          e('h3', null, '🚫 Hoja incorrecta'),
+          e('p', null,
+            `Los datos calculados corresponden a "${data.meta.mes}" ` +
+            `pero tienes activa "${hojaActual ? hojaActual.nombre : '—'}".`
+          ),
+          e('p', null,
+            'Vuelve a la hoja correcta o recalcula para la hoja actual.'
+          ),
+          e('div', { className: 'modal-actions' },
+            e('button', {
+              onClick: () => {
+                setShowHojaError(false);
+                setData(null);
+                calcular();
+              }
+            }, `Calcular para "${hojaActual ? hojaActual.nombre : ''}"`),
+            e('button', {
+              onClick: () => setShowHojaError(false)
+            }, 'Cerrar')
+          )
+        )
+      )
+    );
+  }
+
+  /* ========= RESUMEN ========= */
+
+  function renderResumen(resumen) {
+    return e('div', { className: 'resumen' },
+      e('h3', null, 'Resumen de cargas'),
+      e('table', null,
+        e('thead', null,
+          e('tr', null,
+            e('th', { className: 'col-persona', title: 'Controlador' }, 'CTA'),
+            e('th', { className: 'col-cargo',   title: 'Puesto' }, 'Cargo'),
+            e('th', { className: 'col-num', title: 'Supervisiones año' }, 'Sup.A'),
+            e('th', { className: 'col-num', title: '% anual' }, '%A'),
+            e('th', { className: 'col-num', title: 'Supervisiones mes' }, 'Sup.M'),
+            e('th', { className: 'col-num', title: '% mensual' }, '%M'),
+            e('th', { className: 'col-num', title: 'Límite mensual' }, 'Lim'),
+            e('th', { className: 'col-num', title: 'Servicios del mes' }, 'Serv')
+          )
+        ),
+        e('tbody', null,
+          Object.entries(resumen).map(([id, r]) => {
+            const pctMes   = r.totalMes  ? Math.round((r.supMes  / r.totalMes)        * 100) : 0;
+            const pctAnual = r.pctAnual  ? Math.round(r.pctAnual * 100)  : 0;
+            return e('tr', { key: id },
+              e('td', { className: 'col-persona' }, id),
+              e('td', { className: 'col-cargo' },   r.cargo),
+              e('td', { className: 'col-num' }, r.supAnual),
+              e('td', { className: 'col-num' }, pctAnual + '%'),
+              e('td', { className: 'col-num' }, r.supMes),
+              e('td', { className: 'col-num' }, pctMes + '%'),
+              e('td', { className: 'col-num' }, r.limiteMes),
+              e('td', { className: 'col-num' }, r.totalMes)
+            );
+          })
+        )
+      )
+    );
+  }
+
+  /* ========= DETALLE ========= */
+
+  function renderPropuestas(
+    claves, propuestas, cambiarAsignado, toggleBloqueo, toggleBloquearTodo, loading
+  ) {
+    const diasMap = {};
+    claves.forEach(clave => {
+      const p = propuestas[clave];
+      if (!diasMap[p.dia]) diasMap[p.dia] = [];
+      diasMap[p.dia].push({ clave, ...p });
+    });
+
+    return e('div', null,
+      e('h3', null, 'Detalle por día'),
+      e('button', {
+        onClick: toggleBloquearTodo,
+        disabled: loading,
+        style: { marginBottom: '8px' }
+      }, 'Bloquear / desbloquear todo'),
+
+      Object.keys(diasMap).map(dia =>
+        e('div', { className: 'dia', key: dia },
+          e('strong', null, `Día ${dia}`),
+          diasMap[dia].map(p =>
+            e('div', {
+              className: 'turno ' + (p.conflicto ? 'conflicto' : ''),
+              key: p.clave
+            },
+              e('span', null, p.turno + ':'),
+              p.conflicto
+                ? e('span', null, 'SIN CANDIDATO')
+                : e('select', {
+                    value: p.asignadoActual,
+                    disabled: p.bloqueado || loading,
+                    onChange: ev => cambiarAsignado(p.clave, ev.target.value)
+                  },
+                  p.candidatos.map(c =>
+                    e('option', { key: c.id, value: c.id }, c.id)
+                  )
+                ),
+              e('label', null,
+                e('input', {
+                  type: 'checkbox',
+                  checked: p.bloqueado,
+                  disabled: loading,
+                  onChange: () => toggleBloqueo(p.clave)
+                }),
+                ' Bloquear'
+              ),
+              p.origen === 'MANUAL'
+                ? e('span', { className: 'bloqueado' }, '✋')
+                : null
+            )
+          )
+        )
+      )
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+</script>

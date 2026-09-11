@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta name="version-app" content="app-3">
+    <?!= include('Estilos'); ?>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      window.TOKEN = <?!= JSON.stringify(token) ?>;
+      window.USUARIO = <?!= usuarioJson ?>;
+    </script>
+    <?!= include('Js'); ?>
+  </body>
+</html>
