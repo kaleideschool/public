@@ -1,0 +1,1120 @@
+From 75f488aaed08da232e3880ba012253d35183adaf Mon Sep 17 00:00:00 2001
+From: Claude <ground.contact@gmail.com>
+Date: Fri, 11 Sep 2026 14:12:33 +0000
+Subject: [PATCH 1/2] Cambio directo entre controladores desde Incidencias, y
+ dos arreglos
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+El admin puede aplicar un cambio entre dos controladores sin la ronda de
+solicitud / aceptación / validación, para cuando el acuerdo ya existe fuera
+de la app. Y de camino, dos cosas que estaban mal.
+
+ARREGLO · la caché de CONTROLADORES no acertaba nunca (Turnero.js)
+
+  leerControladoresCache() leía de 'controladores_<CACHE_V>' pero escribía en
+  'controladores', sin el sufijo. El get fallaba siempre, así que cada llamada
+  releía la hoja CONTROLADORES entera — y la llama identificarPorToken, o sea
+  todas las peticiones, varias veces. Las otras cachés (cargos_cta_, puestos_,
+  mes_) sí usaban el sufijo en ambos lados; era la única descuadrada.
+
+ARREGLO · registrarCambioAdmin se saltaba el anti-solapamiento (Backend.js)
+
+  registrarCambio comprueba _bloqueados() bajo lock antes de registrar; la vía
+  de admin no, así que era la única forma de acabar con dos solicitudes
+  reservando la misma celda. Ahora comprueba igual, con lectura fresca, y
+  rechaza además los meses pasados.
+
+NUEVO · cambio directo (Backend.js, Js.html)
+
+  _candidatosPara() — el núcleo de _candidatosCadena, con el protagonista como
+  parámetro en vez de "quien llama". Antes leía u.cta directamente y solo servía
+  para uno mismo. _candidatosCadena queda como una línea encima; la lista es la
+  misma para todos, no dos que se separen con cada arreglo.
+
+  candidatosCambioAdmin(token, mes, dia, cta) — con quién puede cambiar OTRO
+  controlador. Incluye a quien haya marcado 🔒, marcado y ordenado el último:
+  el bloqueo es una cortesía entre compañeros, no una prohibición, y quien
+  ordena un cambio tiene que poder verlo.
+
+  cambioDirectoAdmin(token, mes, movimientos, opts) — lo aplica: fila en CAMBIOS
+  ya TRANSCRITO, turnero por _aplicarTurnoCelda (LOG_CELDAS, deshacible) y línea
+  en LOG_CAMBIOS.
+
+  Lo que NO se salta:
+  · La legalidad se comprueba igual, con fronteras de mes. Se puede forzar, y
+    entonces las violaciones quedan ESCRITAS en la fila y en la columna de
+    chequeo, no se pierden.
+  · La regla ESTADO no se fuerza nunca: significa que la celda no contiene lo
+    que el cliente creía, así que se escribiría encima de otra cosa. Se pide
+    refrescar.
+  · Una solicitud en curso sobre esos días detiene el cambio; solo se sigue
+    anulándola explícitamente, y queda anotado en las dos filas.
+
+  Sí se permite meter en el cambio a un puesto excluido (las jefaturas), a
+  diferencia del circuito normal: el admin ya puede escribir esa celda desde
+  «Cambio directo de turno», y prohibirlo aquí solo le empujaría a hacerlo en
+  dos escrituras sueltas, perdiendo el emparejamiento y el chequeo.
+
+  En la interfaz, sección nueva en Incidencias que reutiliza los selectores de
+  controlador y día que ya había. Las listas de candidatos se tiran al cambiar
+  de persona, día o mes: seguían en pantalla y se podía pulsar «Aplicar» sobre
+  una celda que ya no era la que se miraba.
+
+Tags: backend-105-cambio-directo / turnero-33-cache-ctas / js-105-cambio-directo
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KsJTmss56NeK7qsp97tkLL
+---
+ Backend.js | 239 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ Js.html    | 149 ++++++++++++++++++++++++++++++++-
+ Turnero.js |  10 ++-
+ 3 files changed, 389 insertions(+), 9 deletions(-)
+
+diff --git a/Backend.js b/Backend.js
+index 3b55255..9157a80 100644
+--- a/Backend.js
++++ b/Backend.js
+@@ -16,7 +16,7 @@ var CADUCIDAD_HORAS = 72;
+ // Versión de ESTE fichero. Cada .gs y .html tiene la suya; versiones() las reúne
+ // y se registran en LOG_APP y en el pie de la app para detectar ficheros sin
+ // actualizar o un despliegue viejo. Sube el número al pegar una versión nueva.
+-var VERSION_BACKEND = 'backend-104-saldos';
++var VERSION_BACKEND = 'backend-105-cambio-directo';
+ 
+ // Puestos fuera del circuito de cambios (jefaturas): ni ceden ni reciben turnos.
+ // La lista ya no vive aquí: sale de la hoja PUESTOS y la carga el motor
+@@ -820,9 +820,27 @@ function candidatosCadena(token, mes, dia, movsJson) {
+ }
+ function _candidatosCadena(token, mes, dia, movsJson) {
+   var u = _exigirUsuario(token);
++  return _candidatosPara(u.cta, mes, dia, movsJson, null);
++}
++
++// El núcleo, con el protagonista como PARÁMETRO en vez de «quien llama».
++// Antes esto era el cuerpo de _candidatosCadena y leía `u.cta` directamente, así
++// que solo servía para uno mismo. El admin necesita lo mismo para OTRA persona
++// (ver `candidatosCambioAdmin`), y duplicar noventa líneas habría dejado dos
++// listas de candidatos que se irían separando con cada arreglo.
++//
++// opts.incluirBloqueados: no descarta a quien haya marcado 🔒 ese día, sino que
++// lo devuelve con `bloqueado:true`. El 🔒 es una cortesía entre compañeros —
++// «no me propongáis nada»—, no una prohibición, y un admin que ordena un cambio
++// tiene que poder verlo y decidir.
++function _candidatosPara(yo, mes, dia, movsJson, opts) {
++  opts = opts || {};
+   if (_mesEsPasado(mes)) return { ok: false, error: 'Ese mes ya pasó: no admite cambios.' };
+   dia = Number(dia);
+-  var yo = u.cta;
++  // ⚠️ Sin .toUpperCase(): las claves de `m.base`/`m.cargos` son las iniciales
++  // TAL CUAL están en la hoja (leerMes solo hace trim), y aquí se comparan por
++  // igualdad exacta. Normalizarlas aquí dejaría de encontrar la fila.
++  yo = String(yo || '').trim();
+   var movs = [];
+   if (movsJson) { try { movs = (typeof movsJson === 'string') ? JSON.parse(movsJson) : movsJson; } catch (e) { movs = []; } }
+   if (!Array.isArray(movs)) movs = [];
+@@ -855,7 +873,10 @@ function _candidatosCadena(token, mes, dia, movsJson) {
+     if ((m.vacaciones[cta] || {})[dia] || (m.bajas[cta] || {})[dia]) return;
+     if (bloq[_kb(mes, cta, dia)]) return; // reservado por otra solicitud registrada
+     var dsp = disp[_kb(mes, cta, dia)];
+-    if (dsp && dsp.modo === 'BLOQUEADO') return; // ha bloqueado ese día
++    var haBloqueado = !!(dsp && dsp.modo === 'BLOQUEADO');
++    // Entre compañeros, quien bloquea el día desaparece de la lista. Para el
++    // admin sale, marcado: ver `opts.incluirBloqueados`.
++    if (haBloqueado && !opts.incluirBloqueados) return;
+     var suTurno = (eff[cta] || {})[dia] || '';
+     var movs2, tipo;
+     if (!miLibre) {
+@@ -888,6 +909,7 @@ function _candidatosCadena(token, mes, dia, movsJson) {
+     lista.push({
+       cta: cta, nombre: nombres[cta] || cta, tipo: tipo, suTurno: suTurno || 'libre',
+       ok: r.ok,
++      bloqueado: haBloqueado,   // 🔒 ese día (solo llega si incluirBloqueados)
+       ofrece: ofrece,
+       pref: ofrece ? (dsp.pref || '') : '',
+       prefCoincide: !!(ofrece && dsp.pref && normalizarCodigo(dsp.pref) === normalizarCodigo(suNuevo)),
+@@ -901,7 +923,11 @@ function _candidatosCadena(token, mes, dia, movsJson) {
+   // de cada grupo, primero los que cumplen. Un ⚠ que se ofrece va por delante de
+   // un ✓ que no: el ⚠ puede volverse legal al encadenar otro tramo, y quien se
+   // ha ofrecido es quien más probable es que diga que sí.
+-  function _rango(c) { return (c.prefCoincide ? 4 : 0) + (c.ofrece ? 2 : 0) + (c.ok ? 1 : 0); }
++  // Quien ha bloqueado el día va al final de todo: solo lo ve el admin, y ahí
++  // abajo es donde estorba menos sin dejar de estar disponible.
++  function _rango(c) {
++    return (c.bloqueado ? -8 : 0) + (c.prefCoincide ? 4 : 0) + (c.ofrece ? 2 : 0) + (c.ok ? 1 : 0);
++  }
+   lista.sort(function (a, b) { return _rango(b) - _rango(a); });
+   return {
+     ok: true, dia: dia, miTurno: miTurno || 'libre', miLibre: miLibre,
+@@ -998,13 +1024,30 @@ function registrarCambioAdmin(token, ctaSolicitante, mes, movimientos, motivo) {
+   var solicitante = identificarPorToken(_tokenDe(ctaSolicitante));
+   if (!solicitante) return { ok: false, error: 'Controlador no encontrado: ' + ctaSolicitante };
+   
++  if (_mesEsPasado(mes)) return { ok: false, error: 'No se pueden registrar cambios de meses ya pasados.' };
++
+   // Usar la lógica de registro normal pero con el ADMIN como solicitante temporal
+   // Luego cambia el solicitante al controlador real
+   var lock = LockService.getScriptLock();
+   lock.waitLock(20000);
+   try {
+     var m = _aplicarValidados(mes, leerMes(mes));
+-    
++
++    // Anti-solapamiento, igual que en registrarCambio: si ese (mes, cta, día) ya
++    // tiene una solicitud en curso, crear otra encima deja dos reservas sobre la
++    // misma celda y la que se resuelva la segunda pisa a la primera.
++    // ⚠️ Faltaba aquí: la vía de admin se saltaba la comprobación que sí hace la
++    // vía normal, así que era la única forma de llegar a ese estado.
++    var bloq = _bloqueados(true);   // lectura FRESCA bajo lock
++    for (var b = 0; b < movimientos.length; b++) {
++      var kb = _kb(mes, movimientos[b].cta, movimientos[b].dia);
++      if (bloq[kb]) {
++        _logApp('WARN', 'registrarCambioAdmin', admin.cta + ' choque en ' + kb + ' con #' + bloq[kb]);
++        return { ok: false, error: 'Ya hay una solicitud en curso (#' + bloq[kb] + ') para el día ' +
++          movimientos[b].dia + ' de ' + movimientos[b].cta + '. Debe resolverse antes de crear otra.' };
++      }
++    }
++
+     // Validaciones de legalidad iguales
+     var chequeo = _chequeoConFronteras(mes, m, movimientos);
+     if (!chequeo.ok) return { ok: false, violaciones: chequeo.violaciones };
+@@ -1083,6 +1126,192 @@ function validarYTranscribirAdmin(token, id) {
+ }
+ 
+ 
++/* ═══════════════════════════════════════════════════════════════════════════
++   CAMBIO DIRECTO ENTRE CONTROLADORES  —  «Gestión → Incidencias»
++
++   El circuito normal tiene tres pasos y tres personas: uno propone, el otro
++   acepta, jefatura valida. Es lo correcto cuando el cambio nace de un acuerdo
++   entre compañeros, porque la aceptación ES la prueba del acuerdo.
++
++   Pero hay casos en que el acuerdo ya existe fuera de la app —se ha hablado por
++   teléfono, se ha pedido por escrito, lo impone la operación— y hacer pasar a
++   todo el mundo por las tres pantallas solo retrasa lo inevitable. Para eso
++   está esto: el admin aplica el cambio de una vez y queda registrado como lo
++   que es, un cambio hecho por jefatura.
++
++   Lo que NO se salta:
++   · La legalidad. Se comprueba igual, con fronteras de mes. Se puede forzar
++     —hay días en que hay que hacerlo—, pero entonces las violaciones quedan
++     escritas en la fila, no se pierden.
++   · El estado de partida. Si la hoja no dice lo que el admin cree (regla
++     ESTADO), NO se aplica ni forzando: eso no es una regla laboral que
++     saltarse, es que se está mirando una foto vieja y se escribiría sobre otra
++     cosa.
++   · La traza. Va por _aplicarMovimientosAlTurnero → _aplicarTurnoCelda, así que
++     deja LOG_CELDAS con el valor previo y se puede deshacer día a día como
++     cualquier otro movimiento.
++
++   Sí se permite, a diferencia del circuito normal, meter en el cambio a un
++   puesto excluido (las jefaturas): el admin ya puede escribir esa celda a mano
++   desde «Cambio directo de turno», y prohibirlo aquí solo le empujaría a
++   hacerlo en dos escrituras sueltas, perdiendo el emparejamiento y el chequeo.
++   ═══════════════════════════════════════════════════════════════════════════ */
++
++// Con quién puede cambiar OTRO controlador el día `dia`. Es la misma lista que
++// ve cada uno en su calendario (mismo núcleo, `_candidatosPara`), pero pedida
++// en nombre de un tercero y sin ocultar a quien haya bloqueado el día.
++function candidatosCambioAdmin(token, mes, dia, cta) {
++  _exigirVista(token, 'gestion.rapido');
++  var quien = String(cta || '').trim();
++  if (!quien) return { ok: false, error: 'Falta el controlador.' };
++  var t0 = Date.now();
++  try {
++    var r = _candidatosPara(quien, mes, dia, null, { incluirBloqueados: true });
++    r.cta = quien;
++    _logApp('DEBUG', 'candidatosCambioAdmin', mes + ' d' + dia + ' ' + quien + ' → ' +
++      (r.candidatos ? r.candidatos.length + ' candidatos' : (r.error || 'sin resultado')), '', Date.now() - t0);
++    return _sanear(r);
++  } catch (err) {
++    _logApp('ERROR', 'candidatosCambioAdmin', mes + ' d' + dia + ' ' + quien + ' → ' + _errStr(err), '', Date.now() - t0);
++    throw err;
++  }
++}
++
++// Aplica el bloque de movimientos de una sentada: lo escribe en CAMBIOS ya como
++// TRANSCRITO, lo vuelca al turnero y lo registra en LOG_CAMBIOS.
++//
++// opts: { motivo, solicitante, forzar }
++//   · solicitante — a quién se le atribuye la petición. Por defecto, el primero
++//     del bloque: la fila de CAMBIOS sigue diciendo de quién era el cambio, no
++//     del admin que lo tecleó (que queda en NOTAS y en LOG_CELDAS).
++//   · forzar — aplicar pese a las violaciones, y pese a pisar solicitudes en
++//     curso (que se anulan, porque ya no representan nada).
++function cambioDirectoAdmin(token, mes, movimientos, opts) {
++  var admin = _exigirVista(token, 'gestion.rapido');
++  opts = opts || {};
++  if (_mesEsPasado(mes)) return { ok: false, error: 'Ese mes ya pasó: no admite cambios.' };
++  movimientos = movimientos || [];
++  if (!movimientos.length) return { ok: false, error: 'No hay ningún movimiento que aplicar.' };
++
++  var forzar = !!opts.forzar;
++  var motivo = String(opts.motivo || '').trim();
++
++  var lock = LockService.getScriptLock();
++  lock.waitLock(30000);
++  try {
++    var m = _aplicarValidados(mes, leerMes(mes));   // fresco bajo lock
++
++    // 1. ¿Pisamos alguna solicitud en curso? Se mira SIEMPRE, porque dejar dos
++    //    reservas sobre la misma celda es el estado del que no se sale solo.
++    var bloq = _bloqueados(true);
++    var choques = {};
++    movimientos.forEach(function (mv) {
++      var id = bloq[_kb(mes, mv.cta, mv.dia)];
++      if (id) choques[id] = true;
++    });
++    var idsChoque = Object.keys(choques);
++    if (idsChoque.length && !forzar) {
++      return { ok: false, conflictos: idsChoque,
++        error: 'Hay ' + (idsChoque.length === 1 ? 'una solicitud en curso' : idsChoque.length + ' solicitudes en curso') +
++          ' sobre esos días (#' + idsChoque.join(', #') + '). Aplicar el cambio directo las dejaría sin sentido: ' +
++          'resuélvelas antes, o confirma para anularlas.' };
++    }
++
++    // 2. Legalidad, con fronteras de mes.
++    var chequeo = _chequeoConFronteras(mes, m, movimientos);
++    var viol = chequeo.violaciones || [];
++
++    // 2b. ESTADO no se fuerza NUNCA: significa que la celda no contiene lo que
++    //     el cliente creía, así que `a` se escribiría encima de otra cosa.
++    var desfase = viol.filter(function (v) { return v.regla === 'ESTADO'; });
++    if (desfase.length) {
++      return { ok: false, refrescar: true, violaciones: desfase,
++        error: 'El cuadrante ha cambiado desde que cargaste la pantalla. Actualiza y vuelve a intentarlo.' };
++    }
++    if (!chequeo.ok && !forzar) {
++      return { ok: false, violaciones: viol, avisos: chequeo.avisos || [] };
++    }
++
++    // 3. Forzando: las solicitudes que pisamos se anulan, con su motivo. Antes
++    //    de escribir nada nuestro, para que el orden del histórico se lea bien.
++    var anuladas = [];
++    idsChoque.forEach(function (id) {
++      var loc = _localizar(id);
++      if (!loc) return;
++      _actualizarCelda(loc.fila, COLS.ESTADO, 'ANULADO');
++      _actualizarCelda(loc.fila, COLS.NOTAS,
++        'Anulada por el cambio directo aplicado por ' + admin.cta + ' el ' + new Date().toISOString());
++      anuladas.push(id);
++    });
++
++    // 4. La fila en CAMBIOS, ya transcrita.
++    var solicitante = String(opts.solicitante || movimientos[0].cta || '').trim() || admin.cta;
++    var participantes = participantesDe(movimientos).map(function (cta) {
++      // Nadie ha pulsado «acepto»: lo hace constar el admin. `porAdmin` deja
++      // dicho que la aceptación no salió de esta app, que es la diferencia real
++      // con un cambio del circuito normal.
++      return { cta: cta, confirma: 'ACEPTA', cancela: null, porAdmin: true };
++    });
++
++    var id = Utilities.getUuid().slice(0, 8);
++    var ahora = new Date();
++    var notas = 'Cambio directo aplicado por ' + admin.cta + (motivo ? ': ' + motivo : '');
++    if (anuladas.length) notas += ' · anula #' + anuladas.join(', #');
++    if (!chequeo.ok) {
++      notas += ' · ⚠ FORZADO pese a: ' + viol.map(function (v) {
++        return v.regla + (v.cta ? ' (' + v.cta + ')' : '') + ' ' + v.detalle;
++      }).join(' | ');
++    }
++    if (chequeo.avisos && chequeo.avisos.length) notas += ' · ' + chequeo.avisos.join(' | ');
++
++    var fila = [];
++    fila[COLS.ID - 1] = id;
++    fila[COLS.TS - 1] = ahora;
++    fila[COLS.SOLICITANTE - 1] = solicitante;
++    fila[COLS.MES - 1] = _mesCanon(mes);
++    fila[COLS.TIPO - 1] = derivarTipo(movimientos);
++    fila[COLS.MOVIMIENTOS - 1] = JSON.stringify(_conIdentidad(movimientos));
++    fila[COLS.PARTICIPANTES - 1] = JSON.stringify(_conIdentidad(participantes));
++    fila[COLS.CHEQUEO - 1] = JSON.stringify({ ok: chequeo.ok, violaciones: viol, forzado: !chequeo.ok });
++    fila[COLS.ESTADO - 1] = 'TRANSCRITO';
++    fila[COLS.VALIDADO_POR - 1] = admin.cta + ' · directo · ' + ahora.toISOString();
++    fila[COLS.REF - 1] = String(opts.ref || '');
++    fila[COLS.CADUCA - 1] = '';      // no caduca: ya está hecho
++    fila[COLS.NOTAS - 1] = notas.slice(0, 4000);
++    _hojaCambios().appendRow(fila);
++
++    // 5. Al turnero. Punto único de escritura → LOG_CELDAS → deshacible.
++    var escrito = true;
++    try {
++      _aplicarMovimientosAlTurnero(mes, movimientos, admin.cta, id);
++    } catch (err) {
++      escrito = false;
++      _logApp('ERROR', 'cambioDirectoAdmin', 'registrado ' + id + ' pero NO escrito en el turnero: ' + _errStr(err), admin.cta);
++    }
++
++    _log({ id: id, mes: _mesCanon(mes), tipo: derivarTipo(movimientos), movimientos: movimientos,
++           solicitante: solicitante, validadoPor: admin.cta + ' (directo)' }, admin.cta, chequeo.ok);
++
++    _invalidarCambios();
++    invalidarCacheMes(mes);
++    _logApp('INFO', 'cambioDirectoAdmin', admin.cta + ' aplica ' + resumirCambio(movimientos) +
++      ' [' + id + ']' + (chequeo.ok ? '' : ' FORZADO') + (anuladas.length ? ' · anula #' + anuladas.join(', #') : ''), admin.cta);
++
++    return {
++      ok: true, id: id, estado: 'TRANSCRITO',
++      escrito: escrito,
++      forzado: !chequeo.ok,
++      violaciones: chequeo.ok ? [] : viol,
++      anuladas: anuladas,
++      avisos: chequeo.avisos || [],
++      resumen: resumirCambio(movimientos),
++      error: escrito ? '' : 'El cambio quedó registrado pero no se pudo escribir en la hoja del mes. Revísalo a mano.'
++    };
++  } finally {
++    lock.releaseLock();
++  }
++}
++
+ // ═══════════════════════════════════════════════════════════════════════════
+ // API — bandejas
+ // ═══════════════════════════════════════════════════════════════════════════
+diff --git a/Js.html b/Js.html
+index 0562af7..da09340 100644
+--- a/Js.html
++++ b/Js.html
+@@ -2,7 +2,7 @@
+ <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+ <script>
+   const e = React.createElement;
+-  window.VERSION_JS = 'js-104-saldos';
++  window.VERSION_JS = 'js-105-cambio-directo';
+ 
+   // ── Caché de sesión del navegador ──────────────────────────────────────────
+   // Al cambiar de pestaña se pinta AL INSTANTE lo último conocido y se refresca
+@@ -3929,6 +3929,7 @@ function AdminPanel(props) {
+   const [cub, setCub] = React.useState(null);        // candidatos para cubrir
+   const [cubTurno, setCubTurno] = React.useState('M');
+   const [cubTipo, setCubTipo] = React.useState('E');
++  const [camb, setCamb] = React.useState(null);      // candidatos para CAMBIAR con él
+ 
+   React.useEffect(function () {
+     setMsg(null);
+@@ -3958,7 +3959,14 @@ function AdminPanel(props) {
+       .then(function (r) { setHist((r && r.entradas) || []); })
+       .catch(function () { setHist([]); });
+   }
+-  React.useEffect(cargarHist, [props.mes, cta, dia]);
++  // Al cambiar de persona, de día o de mes, las listas de candidatos que
++  // hubiera en pantalla son de OTRA celda: se tiran. Dejarlas visibles invita a
++  // pulsar «Aplicar» sobre un día que ya no es el que se está mirando.
++  React.useEffect(function () {
++    setCamb(null);
++    setCub(null);
++    cargarHist();
++  }, [props.mes, cta, dia]);
+ 
+   function buscarCobertura() {
+     props.setCargando(true); setMsg(null); setCub(null);
+@@ -3995,6 +4003,86 @@ function AdminPanel(props) {
+       });
+   }
+ 
++  // ── Cambio directo entre controladores ───────────────────────────────────
++  // El circuito normal son tres pasos y tres personas. Cuando el acuerdo ya
++  // existe fuera de la app, esto lo aplica de una vez: mismo chequeo de
++  // legalidad, misma traza en LOG_CELDAS, pero sin la ronda de confirmaciones.
++  function buscarCambio() {
++    props.setCargando(true); setMsg(null); setCamb(null);
++    run('candidatosCambioAdmin', props.mes, dia, cta)
++      .then(function (r) {
++        if (!r || r.ok === false) { setMsg({ ok: false, txt: (r && r.error) || 'No se pudo buscar.' }); return; }
++        setCamb(r);
++      })
++      .catch(function (e2) { setMsg({ ok: false, txt: String(e2 && e2.message ? e2.message : e2) }); })
++      .finally(function () { props.setCargando(false); });
++  }
++
++  // Un solo sitio para lanzarlo, se fuerce o no: así el camino de «anular las
++  // solicitudes y seguir» no puede quedar desincronizado del normal.
++  function enviarCambio(c, forzar) {
++    props.setCargando(true); setMsg(null);
++    return run('cambioDirectoAdmin', props.mes, c.movimientos, {
++      motivo: motivo || 'Cambio directo aplicado por jefatura',
++      solicitante: cta,
++      forzar: !!forzar
++    }).then(function (r) {
++      if (!r) { setMsg({ ok: false, txt: 'El servidor no respondió.' }); return; }
++
++      // Solicitudes en curso sobre esos días: se ofrece anularlas y seguir.
++      if (r.ok === false && r.conflictos && r.conflictos.length && !forzar) {
++        return confirmar(r.error + '\n\n¿Anulo esas solicitudes y aplico el cambio?',
++          { titulo: 'Hay solicitudes en curso', ok: 'Anular y aplicar', peligro: true })
++          .then(function (si) { if (si) return enviarCambio(c, true); });
++      }
++      if (r.ok === false) {
++        setMsg({ ok: false, txt: (r.error || 'No se pudo aplicar.') +
++          (r.violaciones && r.violaciones.length
++            ? ' — ' + r.violaciones.map(function (v) { return reglaTxt(v.regla) + ' (' + v.detalle + ')'; }).join('; ')
++            : '') });
++        // Si el cuadrante se ha movido, lo cacheado ya no vale.
++        if (r.refrescar) return recargarCache('global_' + props.mes, setCal, 'getCalendarioGlobal', props.mes);
++        return;
++      }
++
++      setMsg({
++        ok: r.escrito !== false,
++        txt: (r.escrito === false ? '⚠ ' : '✓ ') + 'Cambio aplicado: ' + r.resumen +
++          (r.forzado ? ' · ⚠ FORZADO pese a incumplimientos (queda anotado)' : '') +
++          (r.anuladas && r.anuladas.length ? ' · anuladas #' + r.anuladas.join(', #') : '') +
++          (r.escrito === false ? ' · ' + r.error : '')
++      });
++      setCamb(null);
++      setMotivo('');
++      // Cambia el turnero entero, no una celda: fuera todo lo cacheado del mes.
++      olvidarPrefijo('global_' + props.mes);
++      return recargarCache('global_' + props.mes, setCal, 'getCalendarioGlobal', props.mes);
++    }).catch(function (e2) {
++      setMsg({ ok: false, txt: String(e2 && e2.message ? e2.message : e2) });
++    }).finally(function () { cargarHist(); props.setCargando(false); });
++  }
++
++  function aplicarCambio(c) {
++    const detalle = c.movimientos.map(function (mv) {
++      return '· ' + mv.cta + ', día ' + mv.dia + ': ' + (mv.de || 'libre') + ' → ' + (mv.a || 'libre');
++    }).join('\n');
++    const cabecera = {
++      INTERCAMBIO: 'Intercambio de turnos',
++      CESION: 'Cesión de turno',
++      RECEPCION: 'Recepción de turno'
++    }[c.tipo] || 'Cambio de turnos';
++
++    confirmar(
++      cabecera + ' entre ' + cta + ' y ' + c.cta + ' (' + c.nombre + '):\n\n' + detalle +
++      '\n\nSe aplica AHORA, sin pedirles confirmación y sin pasar por validación. ' +
++      'Queda registrado a nombre de ' + cta + ', con tu firma, y se puede deshacer día a día.' +
++      (c.bloqueado ? '\n\n🔒 ' + c.cta + ' había bloqueado ese día.' : '') +
++      (c.ok ? '' : '\n\n⚠ OJO: incumpliría — ' + c.detalles.join('; ') +
++                   '\n\nSi sigues, el cambio se aplica igualmente y el incumplimiento queda escrito en la fila.'),
++      { titulo: 'Aplicar cambio directo', ok: c.ok ? 'Aplicar' : 'Forzar y aplicar', peligro: !c.ok })
++      .then(function (si) { if (si) return enviarCambio(c, !c.ok); });
++  }
++
+   // Deshacer = devolver la celda al valor previo de la última entrada viva.
+   function deshacer() {
+     props.setCargando(true);
+@@ -4193,6 +4281,63 @@ function AdminPanel(props) {
+       }, categoria === 'RESTABLECER' ? '↺ Eliminar Sobreescritura y Restablecer Turno Base' : 'Aplicar Operación')
+     ),
+ 
++    // ── Cambio directo entre controladores ────────────────────────────────
++    e('div', { style: { marginTop: '14px', borderTop: '1px solid #e5e7eb', paddingTop: '10px' } },
++      e('b', { style: { fontSize: '13px' } }, '🔀 Cambiar el día ' + dia + ' de ' + cta + ' con otro controlador'),
++      e('p', { className: 'muted', style: { fontSize: '11px' } },
++        'Aplica el cambio en el acto: ni lo confirma el compañero ni pasa por validación. ' +
++        'Úsalo cuando el acuerdo ya está hecho fuera de la app.'),
++      e('p', { className: 'muted', style: { fontSize: '11px' } },
++        'Se comprueba la legalidad igual que en el circuito normal. Si algo no cumple sale ⚠ y ' +
++        'puedes forzarlo, pero el incumplimiento queda escrito en la fila del cambio. ' +
++        'Todo pasa por LOG_CELDAS, así que se deshace día a día como cualquier otra acción.'),
++      e('div', { className: 'fila' },
++        e('span', { className: 'muted', style: { fontSize: '12px' } },
++          turnoActual ? ('Ahora tiene ' + turnoActual) : 'Ese día libra'),
++        e('button', { type: 'button', className: 'sec', onClick: buscarCambio }, 'Buscar con quién puede cambiar')),
++
++      camb && e('div', { style: { marginTop: 6 } },
++        camb.candidatos.length === 0
++          ? e('p', { className: 'rojo', style: { fontSize: '12px' } },
++              'No hay con quién: o no queda nadie con turno intercambiable ese día, ' +
++              'o están de vacaciones o de baja, o ya tienen una solicitud en curso.')
++          : e('table', { className: 'tabla-turnero' },
++              e('thead', null, e('tr', null,
++                e('th', null, 'CTA'),
++                e('th', { title: 'Lo que tiene ahora ese día' }, 'Tiene'),
++                e('th', null, 'Queda'),
++                e('th', null, 'Tipo'),
++                e('th', null, 'Legal'),
++                e('th', null, ''))),
++              e('tbody', null, camb.candidatos.slice(0, 15).map(function (c) {
++                // Con qué se queda cada uno tras el cambio, que es lo que de
++                // verdad se mira antes de pulsar.
++                const mioNuevo = (c.movimientos.filter(function (mv) { return mv.cta === camb.cta; })[0] || {}).a;
++                const suyoNuevo = (c.movimientos.filter(function (mv) { return mv.cta === c.cta; })[0] || {}).a;
++                return e('tr', { key: c.cta, style: c.ok ? null : { opacity: .6 } },
++                  e('td', null,
++                    c.bloqueado ? e('span', { title: 'Había bloqueado ese día' }, '🔒 ') : null,
++                    c.ofrece ? e('span', { title: 'Se ha ofrecido para cambiar ese día' }, '🙋 ') : null,
++                    e('b', null, c.cta), ' ', e('span', { className: 'muted' }, c.nombre)),
++                  e('td', null, c.suTurno === 'libre' ? e('span', { className: 'muted' }, 'libra') : e('b', null, c.suTurno)),
++                  e('td', { className: 'muted', style: { fontSize: '11px' } },
++                    cta + ': ' + (mioNuevo === 'libre' || !mioNuevo ? 'libre' : mioNuevo) +
++                    ' · ' + c.cta + ': ' + (suyoNuevo === 'libre' || !suyoNuevo ? 'libre' : suyoNuevo)),
++                  e('td', { className: 'muted', style: { fontSize: '11px' } }, c.tipo),
++                  e('td', {
++                    className: c.ok ? 'verde' : 'rojo',
++                    title: c.ok ? '' : c.detalles.join(' · ')
++                  }, c.ok ? '✓' : '⚠'),
++                  e('td', null, e('button', {
++                    type: 'button',
++                    className: c.ok ? 'accion' : 'sec',
++                    style: { fontSize: '11px', padding: '2px 6px' },
++                    onClick: function () { aplicarCambio(c); }
++                  }, c.ok ? 'Aplicar' : 'Forzar')));
++              })))),
++      camb && camb.candidatos.length > 15 && e('p', { className: 'muted', style: { fontSize: '10px' } },
++        'Se muestran los 15 primeros de ' + camb.candidatos.length + '.')),
++
+     // ── Quién puede cubrir ────────────────────────────────────────────────
+     e('div', { style: { marginTop: '14px', borderTop: '1px solid #e5e7eb', paddingTop: '10px' } },
+       e('b', { style: { fontSize: '13px' } }, '🔎 ¿Quién puede cubrir el día ' + dia + '?'),
+diff --git a/Turnero.js b/Turnero.js
+index 54b7146..08a2555 100644
+--- a/Turnero.js
++++ b/Turnero.js
+@@ -7,7 +7,7 @@
+  *
+  ******************************************************************************/
+ 
+-var VERSION_TURNERO = 'turnero-32-ajustes';
++var VERSION_TURNERO = 'turnero-33-cache-ctas';
+ var TURNERO = {
+   FILA_DIAS: 3, FILA_CTA_INICIO: 4, COL_CARGO: 1, COL_CTA: 3, COL_DIA_INICIO: 4
+ };
+@@ -86,7 +86,13 @@ function leerControladoresCache() {
+     } catch (e) {}
+   }
+   var c = leerControladores();
+-  try { _cache().put('controladores', JSON.stringify(c), CACHE_SEG_CTAS); } catch (e) {}
++  // ⚠️ La clave DEBE llevar el sufijo CACHE_V, igual que el `get` de arriba y
++  // que `invalidarCacheControladores`. Sin él se escribía en 'controladores' y
++  // se leía de 'controladores_v7', así que el `get` no acertaba NUNCA: cada
++  // llamada releía la hoja CONTROLADORES entera. Y esta función se llama en
++  // cada petición varias veces (identificarPorToken la usa la primera),
++  // así que era la lectura más cara de la app repetida sin motivo.
++  try { _cache().put('controladores_' + CACHE_V, JSON.stringify(c), CACHE_SEG_CTAS); } catch (e) {}
+   return c;
+ }
+ function invalidarCacheControladores() { _cache().remove('controladores_' + CACHE_V); }
+-- 
+2.43.0
+
+
+From b8b795a07c48484d28fc427dd64cb1b5050d2afd Mon Sep 17 00:00:00 2001
+From: Claude <ground.contact@gmail.com>
+Date: Fri, 11 Sep 2026 14:12:33 +0000
+Subject: [PATCH 2/2] test: banco de pruebas en Node con Apps Script simulado
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+test/fakegas.js simula lo justo de SpreadsheetApp, CacheService, LockService,
+PropertiesService, Utilities y MailApp — incluidos fondos de celda y notas, que
+en este proyecto son información y no decoración. test/test.js carga los .js de
+verdad en ese contexto, así que prueba el código que se despliega, no una copia.
+
+    node test/test.js     # 63 comprobaciones
+
+Cubre el motor (R1/R2/R3 y el suplemento del art. 47.10), los dos arreglos, y
+el cambio directo: camino feliz, balance, legalidad, forzado, choque con
+solicitudes en curso, permisos y jefaturas.
+
+No lo sube clasp: .claspignore es una lista blanca y test/ no está en ella.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KsJTmss56NeK7qsp97tkLL
+---
+ test/fakegas.js | 137 +++++++++++++++++++
+ test/test.js    | 344 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 481 insertions(+)
+ create mode 100644 test/fakegas.js
+ create mode 100644 test/test.js
+
+diff --git a/test/fakegas.js b/test/fakegas.js
+new file mode 100644
+index 0000000..679c5e9
+--- /dev/null
++++ b/test/fakegas.js
+@@ -0,0 +1,137 @@
++// Simulacro mínimo de Apps Script para poder ejercitar el backend en Node.
++// No pretende ser fiel a todo: solo a lo que este proyecto usa.
++
++function Celda() { return { v: '', bg: '#ffffff', note: '' }; }
++
++class Hoja {
++  constructor(nombre, id) {
++    this.nombre = nombre; this.id = id;
++    this.filas = [];            // array de arrays de Celda
++    this.maxCols = 40;
++  }
++  _asegurar(fila, col) {
++    while (this.filas.length < fila) {
++      const f = []; for (let i = 0; i < this.maxCols; i++) f.push(Celda());
++      this.filas.push(f);
++    }
++    for (const f of this.filas) while (f.length < col) f.push(Celda());
++    if (col > this.maxCols) this.maxCols = col;
++  }
++  getName() { return this.nombre; }
++  getSheetId() { return this.id; }
++  getMaxRows() { return Math.max(this.filas.length, 100); }
++  getMaxColumns() { return this.maxCols; }
++  getLastRow() {
++    let ult = 0;
++    this.filas.forEach((f, i) => { if (f.some(c => String(c.v) !== '')) ult = i + 1; });
++    return ult;
++  }
++  getLastColumn() {
++    let ult = 0;
++    this.filas.forEach(f => f.forEach((c, j) => { if (String(c.v) !== '' && j + 1 > ult) ult = j + 1; }));
++    return ult;
++  }
++  getRange(fila, col, nf, nc) {
++    nf = nf || 1; nc = nc || 1;
++    this._asegurar(fila + nf - 1, col + nc - 1);
++    return new Rango(this, fila, col, nf, nc);
++  }
++  getDataRange() { return this.getRange(1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn())); }
++  appendRow(vals) {
++    const fila = this.getLastRow() + 1;
++    this._asegurar(fila, vals.length);
++    vals.forEach((v, j) => { this.filas[fila - 1][j].v = v === undefined ? '' : v; });
++  }
++  deleteRow(fila) { this.filas.splice(fila - 1, 1); }
++  deleteRows(fila, n) { this.filas.splice(fila - 1, n); }
++  insertRowBefore(fila) {
++    const f = []; for (let i = 0; i < this.maxCols; i++) f.push(Celda());
++    this.filas.splice(fila - 1, 0, f);
++  }
++}
++
++class Rango {
++  constructor(hoja, fila, col, nf, nc) {
++    Object.assign(this, { hoja, fila, col, nf, nc });
++  }
++  _celdas() {
++    const out = [];
++    for (let i = 0; i < this.nf; i++) {
++      const f = [];
++      for (let j = 0; j < this.nc; j++) f.push(this.hoja.filas[this.fila - 1 + i][this.col - 1 + j]);
++      out.push(f);
++    }
++    return out;
++  }
++  getValues() { return this._celdas().map(f => f.map(c => c.v)); }
++  getDisplayValues() { return this._celdas().map(f => f.map(c => String(c.v == null ? '' : c.v))); }
++  getBackgrounds() { return this._celdas().map(f => f.map(c => c.bg)); }
++  getNotes() { return this._celdas().map(f => f.map(c => c.note)); }
++  getValue() { return this._celdas()[0][0].v; }
++  getBackground() { return this._celdas()[0][0].bg; }
++  getNote() { return this._celdas()[0][0].note; }
++  setValues(m) { this._celdas().forEach((f, i) => f.forEach((c, j) => { c.v = (m[i] || [])[j] === undefined ? '' : m[i][j]; })); return this; }
++  setValue(v) { this._celdas().forEach(f => f.forEach(c => { c.v = v; })); return this; }
++  setBackground(hex) { this._celdas().forEach(f => f.forEach(c => { c.bg = hex; })); return this; }
++  setNote(t) { this._celdas().forEach(f => f.forEach(c => { c.note = t; })); return this; }
++  setNumberFormat() { return this; }
++}
++
++class Libro {
++  constructor() { this.hojas = []; this.seq = 1; }
++  getSheets() { return this.hojas.slice(); }
++  getSheetByName(n) { return this.hojas.filter(h => h.nombre === n)[0] || null; }
++  insertSheet(n) { const h = new Hoja(n, this.seq++); this.hojas.push(h); return h; }
++  getSpreadsheetTimeZone() { return 'Atlantic/Canary'; }
++  getActiveSheet() { return this.hojas[0]; }
++}
++
++function construirEntorno(libro) {
++  const cache = {};
++  const props = {};
++  const correos = [];
++  return {
++    SpreadsheetApp: {
++      getActive: () => libro,
++      getActiveSpreadsheet: () => libro,
++      getActiveSheet: () => libro.getActiveSheet(),
++      getUi: () => ({ alert() {}, createMenu: () => ({ addItem() { return this; }, addSeparator() { return this; }, addToUi() {} }) })
++    },
++    CacheService: {
++      getScriptCache: () => ({
++        get: k => (cache[k] === undefined ? null : cache[k]),
++        put: (k, v) => { cache[k] = v; },
++        remove: k => { delete cache[k]; }
++      })
++    },
++    PropertiesService: {
++      getScriptProperties: () => ({
++        getProperty: k => (props[k] === undefined ? null : props[k]),
++        setProperty: (k, v) => { props[k] = v; },
++        deleteProperty: k => { delete props[k]; }
++      })
++    },
++    LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
++    Utilities: {
++      getUuid: () => 'uuid-' + Math.random().toString(36).slice(2, 12),
++      formatDate: (d, tz, fmt) => {
++        const p = n => ('0' + n).slice(-2);
++        return fmt.replace('dd', p(d.getDate())).replace('MM', p(d.getMonth() + 1)).replace('yyyy', d.getFullYear());
++      }
++    },
++    MailApp: { sendEmail: o => correos.push(o) },
++    Session: { getActiveUser: () => ({ getEmail: () => 'admin@test' }) },
++    HtmlService: {
++      createTemplateFromFile: () => ({ evaluate: () => ({ setTitle() { return this; }, addMetaTag() { return this; }, setXFrameOptionsMode() { return this; } }) }),
++      createHtmlOutputFromFile: () => ({ getContent: () => '' }),
++      XFrameOptionsMode: { ALLOWALL: 1 }
++    },
++    ScriptApp: {
++      getProjectTriggers: () => [],
++      getService: () => ({ getUrl: () => 'https://script.google.com/macros/s/TEST/exec' })
++    },
++    _correos: correos, _cache: cache, _props: props
++  };
++}
++
++module.exports = { Libro, Hoja, construirEntorno };
+diff --git a/test/test.js b/test/test.js
+new file mode 100644
+index 0000000..5531053
+--- /dev/null
++++ b/test/test.js
+@@ -0,0 +1,344 @@
++// Banco de pruebas del cambio directo de admin y de los dos arreglos.
++// Carga los .gs de verdad en un contexto con Apps Script simulado.
++const fs = require('fs');
++const vm = require('vm');
++const path = require('path');
++const { Libro, construirEntorno } = require('./fakegas');
++
++// En el repo los ficheros son `.js` y viven en la raíz; en el editor de Apps
++// Script son `.gs`. Se admiten las dos cosas para poder correr esto también
++// sobre una carpeta exportada del proyecto.
++const RAIZ = path.join(__dirname, '..');
++const NOMBRES = ['motor_restricciones', 'logica_cambios', 'Turnero',
++                 'asignacionSup', 'importador', 'Backend'];
++// Orden de carga: como en Apps Script, todo acaba en el mismo ámbito global.
++const FICHEROS = NOMBRES.map(function (n) {
++  for (const ext of ['.js', '.gs']) {
++    if (fs.existsSync(path.join(RAIZ, n + ext))) return n + ext;
++  }
++  throw new Error('No encuentro ' + n + '.js ni ' + n + '.gs en ' + RAIZ);
++});
++
++let fallos = 0, pruebas = 0;
++function ok(cond, txt, extra) {
++  pruebas++;
++  if (cond) { console.log('  ✓ ' + txt); }
++  else { fallos++; console.log('  ✗ ' + txt + (extra !== undefined ? '\n      → ' + JSON.stringify(extra) : '')); }
++}
++function seccion(t) { console.log('\n── ' + t + ' ' + '─'.repeat(Math.max(0, 60 - t.length))); }
++
++// ── Montar un libro de prueba ──────────────────────────────────────────────
++// Mes futuro, para que no sea "pasado" nunca.
++const HOY = new Date();
++const MES3 = ['ENE','FEB','MAR','ABR','MAY','JUN','JUL','AGO','SEP','OCT','NOV','DIC'];
++const futuro = new Date(HOY.getFullYear(), HOY.getMonth() + 1, 1);
++const MES = MES3[futuro.getMonth()] + '-' + ('0' + (futuro.getFullYear() % 100)).slice(-2);
++const N_DIAS = new Date(futuro.getFullYear(), futuro.getMonth() + 1, 0).getDate();
++
++function nuevoEntorno() {
++  const libro = new Libro();
++
++  // Hoja del mes: fila 3 = días, fila 4+ = personas. Col1 cargo, col3 cta, col4+ días.
++  const mes = libro.insertSheet(MES);
++  mes.getRange(3, 1, 1, 3 + N_DIAS).setValues([['', '', ''].concat(
++    Array.from({ length: N_DIAS }, (_, i) => i + 1))]);
++
++  // Patrón cómodo: AA mañanas los impares, BB tardes los impares, CC supervisor.
++  const gente = [
++    { cargo: 'SUP',   cta: 'AA' },
++    { cargo: '',      cta: 'BB' },
++    { cargo: 'SUPIN', cta: 'CC' },
++    { cargo: 'JTWR',  cta: 'JJ' }
++  ];
++  gente.forEach((g, i) => {
++    const fila = 4 + i;
++    mes.getRange(fila, 1).setValue(g.cargo);
++    mes.getRange(fila, 3).setValue(g.cta);
++  });
++  // Turnos: días 1..6 → AA hace M los días 1 y 3; BB hace T el día 1 y M el 3.
++  const poner = (cta, dia, cod) => {
++    const fila = 4 + gente.findIndex(g => g.cta === cta);
++    mes.getRange(fila, 3 + dia).setValue(cod);
++  };
++  poner('AA', 1, 'M'); poner('AA', 3, 'M'); poner('AA', 5, 'M');
++  poner('BB', 1, 'T'); poner('BB', 3, 'T'); poner('BB', 5, 'T');
++  poner('CC', 1, 'Ms'); poner('CC', 3, 'Ms');
++  poner('JJ', 1, 'M');
++
++  // CONTROLADORES: A cta, B nombre, C email, D token, E activo, F rol, G puesto…
++  const ctrl = libro.insertSheet('CONTROLADORES');
++  ctrl.appendRow(['CTA', 'Nombre', 'Email', 'Token', 'Activo', 'Rol', 'puesto', 'grupo', 'activo_extras', 'activo_vacas', 'id', 'alta', 'baja']);
++  ctrl.appendRow(['AA', 'Ana A', 'aa@t', 'tok-aa', 'SÍ', 'CTA', 'SUP', 'G1', 'SÍ', 'SÍ', 'P-aa', '', '']);
++  ctrl.appendRow(['BB', 'Beto B', 'bb@t', 'tok-bb', 'SÍ', 'CTA', '', 'G1', 'SÍ', 'SÍ', 'P-bb', '', '']);
++  ctrl.appendRow(['CC', 'Ceci C', 'cc@t', 'tok-cc', 'SÍ', 'CTA', 'SUPIN', 'G2', 'SÍ', 'SÍ', 'P-cc', '', '']);
++  ctrl.appendRow(['JJ', 'Jefa J', 'jj@t', 'tok-jj', 'SÍ', 'CTA', 'JTWR', 'G2', 'SÍ', 'SÍ', 'P-jj', '', '']);
++  ctrl.appendRow(['ZZ', 'Zoe Admin', 'zz@t', 'tok-zz', 'SÍ', 'ADMIN', 'SUP', 'G1', 'SÍ', 'SÍ', 'P-zz', '', '']);
++
++  const env = construirEntorno(libro);
++  const sandbox = Object.assign({ console, Date, JSON, Math, String, Number, Boolean,
++    Array, Object, isNaN, isFinite, parseInt, parseFloat, RegExp, Error, module: {} }, env);
++  sandbox.globalThis = sandbox;
++  vm.createContext(sandbox);
++  FICHEROS.forEach(f => {
++    vm.runInContext(fs.readFileSync(path.join(RAIZ, f), 'utf8'), sandbox, { filename: f });
++  });
++  return { sandbox, libro, env, mes };
++}
++
++const TOK_ADMIN = 'tok-zz';
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('El motor sigue intacto');
++{
++  const { sandbox } = nuevoEntorno();
++  // 6 mañanas seguidas ya pasan de 50 h: 6 x 8h28 (505' de ventana + 3,5' de
++  // relevo del art. 47.10) = 50h51. Así que quitar la 7ª arregla el R2 pero NO
++  // el R3 — es el motor haciendo lo suyo, con el suplemento aplicado.
++  const r = sandbox.validarBloque(
++    { AA: { 1: 'M', 2: 'M', 3: 'M', 4: 'M', 5: 'M', 6: 'M', 7: 'M' } }, { AA: 'SUP' },
++    [{ cta: 'AA', dia: 7, de: 'M', a: 'libre' }], { cobertura: false });
++  ok(!r.violaciones.some(v => v.regla === 'R2'), 'quitar la 7ª mañana quita el R2');
++  ok(r.violaciones.some(v => v.regla === 'R3'), 'pero 6 mañanas ya pasan de 50 h/ciclo (R3)',
++     r.violaciones.map(v => v.regla + ' ' + v.detalle));
++
++  const r2 = sandbox.validarHorarioIndividual('AA',
++    { 1: 'M', 2: 'M', 3: 'M', 4: 'M', 5: 'M', 6: 'M', 7: 'M' }, {});
++  ok(r2.some(v => v.regla === 'R2'), '7 periodos seguidos disparan R2');
++
++  const r3 = sandbox.validarHorarioIndividual('AA', { 1: 'T', 2: 'M' }, {});
++  ok(r3.some(v => v.regla === 'R1'), 'T seguido de M al día siguiente dispara R1 (<12h)');
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Arreglo 1 · la caché de CONTROLADORES ahora acierta');
++{
++  const { sandbox, env } = nuevoEntorno();
++  sandbox.leerControladoresCache();
++  const claves = Object.keys(env._cache);
++  ok(claves.indexOf('controladores_' + sandbox.CACHE_V) !== -1,
++     'se escribe en controladores_' + sandbox.CACHE_V, claves);
++  ok(claves.indexOf('controladores') === -1, 'ya no se escribe en la clave sin sufijo', claves);
++
++  // Que el hit de verdad evita releer la hoja: se vacía la hoja y aun así responde.
++  const antes = sandbox.leerControladoresCache().length;
++  sandbox.SpreadsheetApp.getActive().getSheetByName('CONTROLADORES').deleteRows(2, 5);
++  const despues = sandbox.leerControladoresCache().length;
++  ok(antes === despues && despues === 5,
++     'segunda llamada sale de caché (no relee la hoja)', { antes, despues });
++
++  sandbox.invalidarCacheControladores();
++  ok(sandbox.leerControladoresCache().length === 0, 'invalidar la caché sí obliga a releer');
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Arreglo 2 · registrarCambioAdmin respeta las solicitudes en curso');
++{
++  const { sandbox } = nuevoEntorno();
++  const movs = [{ cta: 'AA', dia: 1, de: 'M', a: 'T' }, { cta: 'BB', dia: 1, de: 'T', a: 'M' }];
++
++  const r1 = sandbox.registrarCambio('tok-aa', MES, movs, '');
++  ok(r1.ok === true, 'AA registra un intercambio con BB', r1);
++
++  const r2 = sandbox.registrarCambioAdmin(TOK_ADMIN, 'AA', MES, movs, 'otra vez');
++  ok(r2.ok === false, 'el admin YA NO puede registrar otro encima', r2);
++  ok(/solicitud en curso/i.test(r2.error || ''), 'y el error dice cuál choca', r2.error);
++  ok((r2.error || '').indexOf(r1.id) !== -1, 'nombrando su id (' + r1.id + ')', r2.error);
++}
++{
++  const { sandbox } = nuevoEntorno();
++  const r = sandbox.registrarCambioAdmin(TOK_ADMIN, 'AA', MES,
++    [{ cta: 'AA', dia: 1, de: 'M', a: 'T' }, { cta: 'BB', dia: 1, de: 'T', a: 'M' }], 'ok');
++  ok(r.ok === true, 'sin choque, sigue funcionando igual que antes', r);
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Candidatos para el admin (en nombre de otro)');
++{
++  const { sandbox } = nuevoEntorno();
++  const r = sandbox.candidatosCambioAdmin(TOK_ADMIN, MES, 1, 'AA');
++  ok(r.ok === true, 'devuelve lista para AA aunque quien llama es ZZ', r.error);
++  ok(r.cta === 'AA' && r.miTurno === 'M', 'el protagonista es AA y su turno la M del día 1', { cta: r.cta, miTurno: r.miTurno });
++  const bb = (r.candidatos || []).filter(c => c.cta === 'BB')[0];
++  ok(!!bb, 'BB sale como candidato');
++  ok(bb && bb.tipo === 'INTERCAMBIO', 'clasificado como INTERCAMBIO', bb && bb.tipo);
++  ok(bb && bb.movimientos.length === 2, 'con los dos movimientos ya montados', bb && bb.movimientos);
++
++  // La vía normal sigue viva y da lo mismo pedida por el propio interesado.
++  const propia = sandbox.candidatosCadena('tok-aa', MES, 1, null);
++  ok(propia.ok === true && propia.candidatos.length === r.candidatos.length,
++     'candidatosCadena (vía normal) devuelve lo mismo tras el refactor',
++     { propia: propia.candidatos && propia.candidatos.length, admin: r.candidatos.length });
++}
++{
++  // 🔒: el compañero bloquea el día. Debe desaparecer para el compañero y
++  // aparecer marcado para el admin.
++  const { sandbox } = nuevoEntorno();
++  sandbox.setDisponibilidad('tok-bb', MES, 1, 'BLOQUEADO', '');
++  const propia = sandbox.candidatosCadena('tok-aa', MES, 1, null);
++  ok(!propia.candidatos.some(c => c.cta === 'BB'), 'BB bloqueado desaparece para AA');
++  const admin = sandbox.candidatosCambioAdmin(TOK_ADMIN, MES, 1, 'AA');
++  const bb = admin.candidatos.filter(c => c.cta === 'BB')[0];
++  ok(!!bb, 'pero el admin sí lo ve');
++  ok(bb && bb.bloqueado === true, 'marcado como bloqueado', bb && bb.bloqueado);
++  ok(admin.candidatos[admin.candidatos.length - 1].cta === 'BB', 'y ordenado el último');
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Cambio directo · camino feliz');
++{
++  const { sandbox, mes } = nuevoEntorno();
++  const movs = [{ cta: 'AA', dia: 1, de: 'M', a: 'T' }, { cta: 'BB', dia: 1, de: 'T', a: 'M' }];
++  const r = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, movs, { motivo: 'acordado por teléfono' });
++
++  ok(r.ok === true, 'se aplica sin confirmación ni validación', r);
++  ok(r.estado === 'TRANSCRITO', 'nace ya TRANSCRITO', r.estado);
++  ok(r.forzado === false, 'no ha hecho falta forzar');
++  ok(r.escrito === true, 'se escribió en la hoja del mes');
++
++  // La hoja del mes
++  ok(mes.getRange(4, 4).getValue() === 'T', 'la celda de AA del día 1 dice T', mes.getRange(4, 4).getValue());
++  ok(mes.getRange(5, 4).getValue() === 'M', 'la celda de BB del día 1 dice M', mes.getRange(5, 4).getValue());
++  ok(/SYS: \[ZZ\]/.test(mes.getRange(4, 4).getNote()), 'con la nota SYS firmada por el admin', mes.getRange(4, 4).getNote());
++
++  // La fila de CAMBIOS
++  const filaC = sandbox.SpreadsheetApp.getActive().getSheetByName('CAMBIOS')
++    .getRange(2, 1, 1, 13).getValues()[0];
++  ok(filaC[2] === 'AA', 'el solicitante es AA, no el admin', filaC[2]);
++  ok(filaC[8] === 'TRANSCRITO', 'estado TRANSCRITO en la hoja', filaC[8]);
++  ok(/Cambio directo aplicado por ZZ: acordado por teléfono/.test(String(filaC[12])),
++     'las notas dicen quién y por qué', filaC[12]);
++  const parts = JSON.parse(filaC[6]);
++  ok(parts.every(p => p.confirma === 'ACEPTA' && p.porAdmin === true),
++     'los participantes constan aceptados POR ADMIN', parts);
++
++  // LOG_CELDAS: deshacible
++  const log = sandbox.getLogDia(TOK_ADMIN, MES, 'AA', 1);
++  ok(log.entradas.length === 1 && log.entradas[0].previo === 'M' && log.entradas[0].nuevo === 'T',
++     'LOG_CELDAS guarda M → T con el valor previo', log.entradas);
++  const des = sandbox.deshacerDia(TOK_ADMIN, MES, 'AA', 1);
++  ok(des.ok === true && mes.getRange(4, 4).getValue() === 'M',
++     'y deshacer devuelve la celda a M', { des, celda: mes.getRange(4, 4).getValue() });
++
++  // LOG_CAMBIOS
++  const lc = sandbox.SpreadsheetApp.getActive().getSheetByName('LOG_CAMBIOS');
++  ok(lc && lc.getLastRow() === 2, 'queda una línea en LOG_CAMBIOS', lc && lc.getLastRow());
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Cambio directo · el balance lo cuenta');
++{
++  const { sandbox } = nuevoEntorno();
++  // Cesión: AA suelta su M del día 5, BB (que libra ese día... no, BB tiene T) →
++  // usamos CC, que el día 5 libra.
++  const movs = [{ cta: 'AA', dia: 5, de: 'M', a: 'libre' }, { cta: 'CC', dia: 5, de: 'libre', a: 'M' }];
++  const r = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, movs, { motivo: 'cesión' });
++  ok(r.ok === true, 'cesión aplicada', r);
++  const bal = sandbox.getBalance('tok-cc');
++  const deAA = (bal.saldo || []).filter(x => x.cta === 'AA')[0];
++  ok(deAA && deAA.meDeben === 1, 'CC ve que AA le debe un día', bal.saldo);
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Cambio directo · legalidad');
++{
++  const { sandbox, mes } = nuevoEntorno();
++  // AA tiene M el día 3. Si en vez de M hace T el día 3 y ya tiene M el 5… nada.
++  // Forzamos algo ilegal de verdad: BB tiene T el día 1; darle además la M del
++  // día 1 no se puede (ya trabaja). Probamos R1: AA hace M el día 3; le damos la
++  // T del día 2 de nadie… mejor: intercambio que deja a AA con T el 1 y M el…
++  // Lo simple y seguro: pedir un movimiento cuyo `de` no coincide con la hoja.
++  const malos = [{ cta: 'AA', dia: 1, de: 'T', a: 'M' }, { cta: 'BB', dia: 1, de: 'M', a: 'T' }];
++  const r = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, malos, {});
++  ok(r.ok === false, 'un estado de partida que no cuadra se rechaza', r);
++  ok(r.refrescar === true, 'y pide refrescar la pantalla', r);
++
++  const rf = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, malos, { forzar: true });
++  ok(rf.ok === false, 'NI SIQUIERA forzando se aplica (regla ESTADO)', rf);
++  ok(mes.getRange(4, 4).getValue() === 'M', 'la hoja no se ha tocado', mes.getRange(4, 4).getValue());
++}
++{
++  // Una violación laboral de verdad: R1. CC tiene Ms el día 1 (mañana).
++  // Le damos la T del día 1 de BB → CC pasaría a tener dos turnos... no.
++  // Usamos: AA libra el día 2. Le damos una T el día 2 desde alguien.
++  // AA tiene M el 1 y M el 3. Una T el día 2 → fin 23:20 del 2, inicio 06:30 del
++  // 3 = 7h10 < 12h → R1.
++  const { sandbox, mes } = nuevoEntorno();
++  mes.getRange(5, 3 + 2).setValue('T');           // BB hace T el día 2
++  sandbox.invalidarCacheMes(MES);
++  const movs = [{ cta: 'BB', dia: 2, de: 'T', a: 'libre' }, { cta: 'AA', dia: 2, de: 'libre', a: 'T' }];
++
++  const r = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, movs, {});
++  ok(r.ok === false, 'una cesión que rompe el descanso se rechaza por defecto', r);
++  ok((r.violaciones || []).some(v => v.regla === 'R1'), 'diciendo que es R1', r.violaciones);
++
++  const rf = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, movs, { forzar: true, motivo: 'orden de jefatura' });
++  ok(rf.ok === true, 'pero forzando SÍ se aplica', rf);
++  ok(rf.forzado === true, 'marcado como forzado', rf.forzado);
++  ok(mes.getRange(4, 3 + 2).getValue() === 'T', 'y la celda de AA del día 2 queda en T');
++  const filaC = sandbox.SpreadsheetApp.getActive().getSheetByName('CAMBIOS').getRange(2, 1, 1, 13).getValues()[0];
++  ok(/FORZADO pese a: R1/.test(String(filaC[12])), 'el incumplimiento queda ESCRITO en la fila', filaC[12]);
++  ok(JSON.parse(filaC[7]).forzado === true, 'y en la columna de chequeo', filaC[7]);
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Cambio directo · choque con una solicitud en curso');
++{
++  const { sandbox } = nuevoEntorno();
++  const movs = [{ cta: 'AA', dia: 1, de: 'M', a: 'T' }, { cta: 'BB', dia: 1, de: 'T', a: 'M' }];
++  const sol = sandbox.registrarCambio('tok-aa', MES, movs, '');
++  ok(sol.ok === true, 'hay una solicitud en curso de AA', sol);
++
++  const r = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, movs, {});
++  ok(r.ok === false, 'el cambio directo se planta', r);
++  ok((r.conflictos || []).indexOf(sol.id) !== -1, 'y devuelve el id que choca para poder preguntar', r.conflictos);
++
++  const rf = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, movs, { forzar: true });
++  ok(rf.ok === true, 'forzando se aplica', rf);
++  ok((rf.anuladas || []).indexOf(sol.id) !== -1, 'y la solicitud vieja queda anulada', rf.anuladas);
++
++  const filas = sandbox.SpreadsheetApp.getActive().getSheetByName('CAMBIOS').getDataRange().getValues();
++  const vieja = filas.filter(f => f[0] === sol.id)[0];
++  ok(vieja && String(vieja[8]) === 'ANULADO', 'ANULADO en la hoja', vieja && vieja[8]);
++  ok(/Anulada por el cambio directo/.test(String(vieja[12])), 'con el motivo escrito', vieja && vieja[12]);
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Cambio directo · permisos y guardarraíles');
++{
++  const { sandbox } = nuevoEntorno();
++  const movs = [{ cta: 'AA', dia: 1, de: 'M', a: 'T' }, { cta: 'BB', dia: 1, de: 'T', a: 'M' }];
++  let lanzo = false;
++  try { sandbox.cambioDirectoAdmin('tok-aa', MES, movs, {}); } catch (e) { lanzo = /no tiene/i.test(String(e.message)); }
++  ok(lanzo, 'un CTA raso no puede: le falta la vista «Incidencias»');
++
++  let lanzo2 = false;
++  try { sandbox.cambioDirectoAdmin('token-basura', MES, movs, {}); } catch (e) { lanzo2 = /no autorizado/i.test(String(e.message)); }
++  ok(lanzo2, 'un token inválido tampoco');
++
++  const vacio = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, [], {});
++  ok(vacio.ok === false, 'sin movimientos, no hace nada', vacio);
++
++  const pasado = sandbox.cambioDirectoAdmin(TOK_ADMIN, 'ENE-20', movs, {});
++  ok(pasado.ok === false && /pasó/.test(pasado.error), 'un mes pasado se rechaza', pasado);
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++seccion('Cambio directo · jefaturas (permitido a propósito)');
++{
++  const { sandbox } = nuevoEntorno();
++  // JJ es JTWR: fuera del circuito normal de cambios. Intercambio limpio con BB
++  // (M por T el mismo día), que conserva la cobertura de las dos franjas.
++  const movs = [{ cta: 'JJ', dia: 1, de: 'M', a: 'T' }, { cta: 'BB', dia: 1, de: 'T', a: 'M' }];
++  const normal = sandbox.registrarCambio('tok-bb', MES, movs, '');
++  ok(normal.ok === false && /no participa/.test(normal.error || ''),
++     'el circuito normal sigue dejando fuera a JTWR', normal);
++  const directo = sandbox.cambioDirectoAdmin(TOK_ADMIN, MES, movs, { motivo: 'reorganización' });
++  ok(directo.ok === true, 'el admin sí puede hacerlo por la vía directa', directo);
++}
++
++// ═══════════════════════════════════════════════════════════════════════════
++console.log('\n' + '═'.repeat(64));
++console.log(fallos === 0
++  ? `TODO VERDE · ${pruebas} comprobaciones`
++  : `${fallos} FALLOS de ${pruebas} comprobaciones`);
++process.exit(fallos === 0 ? 0 : 1);
+-- 
+2.43.0
+

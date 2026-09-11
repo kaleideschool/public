@@ -5,10 +5,19 @@ const vm = require('vm');
 const path = require('path');
 const { Libro, construirEntorno } = require('./fakegas');
 
-const GAS = path.join(__dirname, '..', 'gas');
+// En el repo los ficheros son `.js` y viven en la raíz; en el editor de Apps
+// Script son `.gs`. Se admiten las dos cosas para poder correr esto también
+// sobre una carpeta exportada del proyecto.
+const RAIZ = path.join(__dirname, '..');
+const NOMBRES = ['motor_restricciones', 'logica_cambios', 'Turnero',
+                 'asignacionSup', 'importador', 'Backend'];
 // Orden de carga: como en Apps Script, todo acaba en el mismo ámbito global.
-const FICHEROS = ['motor_restricciones.gs', 'logica_cambios.gs', 'Turnero.gs',
-                  'asignacionSup.gs', 'importador.gs', 'Backend.gs'];
+const FICHEROS = NOMBRES.map(function (n) {
+  for (const ext of ['.js', '.gs']) {
+    if (fs.existsSync(path.join(RAIZ, n + ext))) return n + ext;
+  }
+  throw new Error('No encuentro ' + n + '.js ni ' + n + '.gs en ' + RAIZ);
+});
 
 let fallos = 0, pruebas = 0;
 function ok(cond, txt, extra) {
@@ -71,7 +80,7 @@ function nuevoEntorno() {
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   FICHEROS.forEach(f => {
-    vm.runInContext(fs.readFileSync(path.join(GAS, f), 'utf8'), sandbox, { filename: f });
+    vm.runInContext(fs.readFileSync(path.join(RAIZ, f), 'utf8'), sandbox, { filename: f });
   });
   return { sandbox, libro, env, mes };
 }
